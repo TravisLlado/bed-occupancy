@@ -16,13 +16,33 @@ Four sensors, one LED:
 
 GPIO2 is skipped because it's a strapping pin (pulling it low at boot can stop the board from booting). GPIO5 is skipped because it's on ADC2, which is unreliable on the C3.
 
-The main loop runs at 100 Hz. Each raw reading is scaled to 0–100% of that sensor's calibrated span (0% = fully pressed, 100% = unpressed), then passed through a hysteresis filter:
+The main loop samples all four sensors at 100 Hz. Each raw reading (12-bit, 0–4095) goes through a hysteresis filter with its own pair of cutoffs:
 
-- below 30% → **occupied**
-- above 70% → **unoccupied**
+- below `low` → **occupied**
+- above `high` → **unoccupied**
 - in between → keeps its previous state
 
-Calibration (`SENSORS[]`) and thresholds (`OCCUPIED_BELOW_PCT`, `UNOCCUPIED_ABOVE_PCT`) are at the top of `src/main.cpp`. Status for all four sensors prints over USB serial at 10 Hz, and each state change prints immediately.
+Defaults are low 1456 and high 2964 (30% / 70% of the tabletop range, about 325 pressed and 4095 unpressed). They're set in `src/config.h`, and you can change them at runtime, per sensor (see below).
+
+## Console (USB serial + web console)
+
+The same commands work over USB serial (`pio device monitor`) and in the browser at **http://bedoccupancy.local/** (or the IP address printed at boot). The web console is a plain terminal page from [WebConsole](https://github.com/TravisLlado/WebConsole): output on a dark background and a command line at the bottom, with Up/Down to recall earlier commands. Both show all four readings once per second, and print each state change as it happens:
+
+```
+S0 4095 --- | S1  410 OCC | S2 4095 --- | S3 4095 --- | bed OCCUPIED
+S1 -> UNOCCUPIED (raw 3120)
+```
+
+| Command | What it does |
+|---|---|
+| `set <0-3\|all> <low\|high> <value>` | Set a cutoff in raw ADC counts, e.g. `set 2 low 1400`. `low` must stay below `high` |
+| `show` | Print every sensor's cutoffs and current reading |
+| `defaults` | Restore the default cutoffs on all sensors |
+| `help` | List commands |
+
+Cutoffs you set are saved to flash (NVS) and survive reboots and reflashing. Use `defaults` to clear them.
+
+Wi-Fi credentials come from the shared `credentials.h`, found through the `CREDENTIALS_INCLUDE` environment variable (same setup as the blinds and thermostat projects). Sensing doesn't depend on Wi-Fi: if the network is down, the sensors and LED keep working, and the board retries the connection every 60 s.
 
 ### ADC note
 
