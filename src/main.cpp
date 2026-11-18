@@ -103,11 +103,10 @@ static void printReadings() {
   size_t n{0};
   bool any{false};
   for (size_t i{0}; i < NUM_SENSORS; i++) {
-    n += snprintf(line + n, sizeof(line) - n, "S%u %4u %s | ", (unsigned)i,
-                  g_raw[i], g_occupied[i] ? "OCC" : "---");
+    n += snprintf(line + n, sizeof(line) - n, "%4u ", g_raw[i]);
     any |= g_occupied[i];
   }
-  snprintf(line + n, sizeof(line) - n, "bed %s\n", any ? "OCCUPIED" : "empty");
+  snprintf(line + n, sizeof(line) - n, "%s\n", any ? "Occupied" : "Empty");
   out("%s", line);
 }
 

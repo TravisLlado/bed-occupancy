@@ -41,7 +41,7 @@ constexpr uint32_t WIFI_CHECK_INTERVAL_MS {60000};  // re-join if disconnected
 // Network /////////////////////////////////////////////////////////////////////
 
 // Web console: http://<MDNS_HOSTNAME>.local/
-constexpr const char* MDNS_HOSTNAME {"bedtest"};
+constexpr const char* MDNS_HOSTNAME {"bedoccupancy"};
 constexpr uint16_t    SERVER_PORT   {80};
 
 // Serial //////////////////////////////////////////////////////////////////////
