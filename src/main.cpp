@@ -8,7 +8,8 @@
  * the bed is occupied while any of its sensors is. The onboard LED is on while
  * either side is occupied.
  *
- * Other nodes read per-side state and the measurement timestamp as JSON from
+ * Other nodes read per-side state, the measurement timestamp, and the bed's
+ * last-in-bed time (occupied for IN_BED_MIN_MS or longer) as JSON from
  * GET <STATE_PATH>. The clock is set from NTP after WiFi joins and re-synced
  * nightly; sensing never waits on it.
  *
@@ -24,6 +25,8 @@
 #include <Preferences.h>
 #include <WebConsole.h>
 #include <esp_sntp.h>
+#include <esp_system.h>
+#include <esp_timer.h>
 #include <stdarg.h>
 #include <time.h>
 #include "config.h"
@@ -46,6 +49,12 @@ static uint16_t g_mean[NUM_SENSORS] {};    // last completed window's mean
 static bool     g_sideOccupied[2] {};      // indexed by Side
 static time_t   g_measuredAt {0};          // last window's end, 0 if clock unset
 
+// Consecutive windows with either side occupied, and the last time the bed had
+// been occupied for IN_BED_MIN_WINDOWS or longer, in seconds since boot. 0 at
+// boot. lastInBedTime() moves it onto the real clock once that's set.
+static uint32_t g_occupiedWindows {0};
+static int64_t  g_lastInBedUptime {0};
+
 // Latest state as served at STATE_PATH. Written by loop(), read by the HTTP
 // handler on the AsyncTCP task, so it's copied under a lock.
 struct StateSnapshot {
@@ -53,6 +62,7 @@ struct StateSnapshot {
   bool   left;
   bool   right;
   time_t measuredAt;
+  time_t lastInBed;  // see lastInBedTime()
 };
 static portMUX_TYPE  s_stateMux = portMUX_INITIALIZER_UNLOCKED;
 static StateSnapshot s_state {};
@@ -151,6 +161,49 @@ static void printReadings() {
   out("%s", line);
 }
 
+// Defined with the clock code below
+static bool    clockValid();
+static int64_t uptimeS();
+static time_t  lastInBedTime();
+
+static void printLastInBed() {
+  char buf[40];
+  const time_t t{lastInBedTime()};
+  if (t == 0) {
+    snprintf(buf, sizeof(buf), "0 (not since boot)");
+  } else if (!clockValid()) {
+    snprintf(buf, sizeof(buf), "%lld s after boot", (long long)t);
+  } else {
+    struct tm lt;
+    localtime_r(&t, &lt);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &lt);
+  }
+  out("Last in bed (%u+ min): %s\n", (unsigned)(IN_BED_MIN_MS / 60000), buf);
+}
+
+// Why the chip last reset, for spotting unexpected reboots
+static const char* resetReasonName() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "power on";
+    case ESP_RST_SW:       return "software restart";
+    case ESP_RST_PANIC:    return "crash";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:      return "watchdog";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+    case ESP_RST_EXT:      return "reset pin";
+    default:               return "other";
+  }
+}
+
+static void printUptime() {
+  const int64_t up{uptimeS()};
+  out("Uptime %lldh %02lldm %02llds (last reset: %s). Occupied streak %u / %u s\n",
+      (long long)(up / 3600), (long long)(up / 60 % 60), (long long)(up % 60),
+      resetReasonName(), (unsigned)g_occupiedWindows, (unsigned)IN_BED_MIN_WINDOWS);
+}
+
 static void printCutoffs() {
   for (size_t i{0}; i < NUM_SENSORS; i++) {
     out("S%u (GPIO%u): low %4u  high %4u\n", (unsigned)i,
@@ -162,7 +215,7 @@ static void printHelp() {
   out("Commands:\n");
   out("  set <0-%u|all> <low|high> <value>   set a cutoff (raw ADC 0-%u)\n",
       (unsigned)(NUM_SENSORS - 1), (unsigned)ADC_MAX);
-  out("  show                               show cutoffs and latest readings\n");
+  out("  show                               show cutoffs, last-in-bed time, latest readings\n");
   out("  defaults                           restore default cutoffs on all sensors\n");
   out("  help                               this list\n");
   out("Cutoffs apply to each sensor's %u ms average reading.\n", (unsigned)AVERAGE_PERIOD_MS);
@@ -237,6 +290,8 @@ static void handleCommand(char* line) {
     cmdSet(tokens[1], tokens[2], tokens[3]);
   } else if (strcmp(cmd, "show") == 0 || strcmp(cmd, "status") == 0) {
     printCutoffs();
+    printLastInBed();
+    printUptime();
     printReadings();
   } else if (strcmp(cmd, "defaults") == 0) {
     for (size_t i{0}; i < NUM_SENSORS; i++) {
@@ -306,6 +361,18 @@ static void onTimeSync(struct timeval*) { s_syncCount = s_syncCount + 1; }
 // no battery-backed RTC, so until then time() is meaningless.
 static bool clockValid() { return s_syncCount > 0; }
 
+// Seconds since boot. 64-bit, so it doesn't wrap like millis().
+static int64_t uptimeS() { return esp_timer_get_time() / 1000000; }
+
+// Last-in-bed time as published: 0 if not since boot, seconds since boot until
+// the clock is set, then Unix seconds UTC. The offset between the two clocks is
+// taken fresh each call, so NTP corrections carry through.
+static time_t lastInBedTime() {
+  if (g_lastInBedUptime == 0 || !clockValid()) return (time_t)g_lastInBedUptime;
+  const int64_t offsetS{(int64_t)time(nullptr) - uptimeS()};
+  return (time_t)(g_lastInBedUptime + offsetS);
+}
+
 // Start SNTP with the local timezone. SNTP retries on its own until the first
 // sync succeeds, then re-syncs in the background every few hours.
 static void startClock() {
@@ -335,6 +402,7 @@ static void serviceClock() {
     char buf[40];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &lt);
     out("Clock set from NTP: %s\n", buf);
+
     // A first sync after tonight's sync hour stands in for tonight's sync
     if (lt.tm_hour >= NIGHTLY_SYNC_HOUR) lastNightlyDay = lt.tm_yday;
   }
@@ -361,10 +429,22 @@ static void serviceClock() {
 // HTTP state interface
 // ============================================================================
 
+// Unix seconds as a JSON number, or null for 0
+static void formatJsonTime(char* buf, size_t size, time_t t) {
+  if (t != 0) {
+    snprintf(buf, size, "%lld", (long long)t);
+  } else {
+    snprintf(buf, size, "null");
+  }
+}
+
 // GET STATE_PATH. Runs on the AsyncTCP task.
-//   200 {"left":false,"right":true,"time":1763512345}
+//   200 {"left":false,"right":true,"time":1763512345,"lastInBed":1763512345}
 //       time: end of the measurement window, Unix seconds UTC; null until the
 //       clock has been set from NTP
+//       lastInBed: last time the bed had been occupied (either side) for
+//       IN_BED_MIN_MS or longer. 0 at boot; seconds since boot until the clock
+//       is set from NTP, then Unix seconds UTC
 //   503 {"error":"starting"} until the first measurement window completes
 static void handleState(AsyncWebServerRequest* request) {
   StateSnapshot s;
@@ -377,14 +457,12 @@ static void handleState(AsyncWebServerRequest* request) {
     response = request->beginResponse(503, "application/json", "{\"error\":\"starting\"}");
   } else {
     char stamp[24];
-    if (s.measuredAt != 0) {
-      snprintf(stamp, sizeof(stamp), "%lld", (long long)s.measuredAt);
-    } else {
-      snprintf(stamp, sizeof(stamp), "null");
-    }
-    char body[80];
-    snprintf(body, sizeof(body), "{\"left\":%s,\"right\":%s,\"time\":%s}",
-             s.left ? "true" : "false", s.right ? "true" : "false", stamp);
+    formatJsonTime(stamp, sizeof(stamp), s.measuredAt);
+    char body[128];
+    snprintf(body, sizeof(body),
+             "{\"left\":%s,\"right\":%s,\"time\":%s,\"lastInBed\":%lld}",
+             s.left ? "true" : "false", s.right ? "true" : "false", stamp,
+             (long long)s.lastInBed);
     response = request->beginResponse(200, "application/json", body);
   }
   response->addHeader("Cache-Control", "no-store");
@@ -443,6 +521,17 @@ static void sampleSensors() {
   g_accumCount++;
 }
 
+// If the bed (either side) has been occupied for IN_BED_MIN_WINDOWS since it
+// was last empty, set the last-in-bed time to now (seconds since boot)
+static void updateLastInBed() {
+  if (g_sideOccupied[SIDE_LEFT] || g_sideOccupied[SIDE_RIGHT]) {
+    if (g_occupiedWindows < IN_BED_MIN_WINDOWS) g_occupiedWindows++;
+    if (g_occupiedWindows >= IN_BED_MIN_WINDOWS) g_lastInBedUptime = uptimeS();
+  } else {
+    g_occupiedWindows = 0;
+  }
+}
+
 // Close the window: compute means, run hysteresis, combine sensors into sides,
 // timestamp, publish, update LED, print
 static void finishWindow() {
@@ -461,9 +550,10 @@ static void finishWindow() {
   }
   g_sideOccupied[SIDE_LEFT]  = side[SIDE_LEFT];
   g_sideOccupied[SIDE_RIGHT] = side[SIDE_RIGHT];
+  updateLastInBed();
 
   portENTER_CRITICAL(&s_stateMux);
-  s_state = {true, side[SIDE_LEFT], side[SIDE_RIGHT], g_measuredAt};
+  s_state = {true, side[SIDE_LEFT], side[SIDE_RIGHT], g_measuredAt, lastInBedTime()};
   portEXIT_CRITICAL(&s_stateMux);
 
   digitalWrite(LED_PIN, (side[SIDE_LEFT] || side[SIDE_RIGHT]) ? LED_ON : LED_OFF);
@@ -478,6 +568,7 @@ static void finishWindow() {
 void setup() {
   Serial.begin(SERIAL_BAUD_RATE);
   Serial.println("\r\n\r\nBed Occupancy");
+  Serial.printf("Reset reason: %s\r\n", resetReasonName());
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LED_OFF);

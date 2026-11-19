@@ -61,6 +61,13 @@ constexpr uint32_t SAMPLES_PER_AVERAGE {AVERAGE_PERIOD_MS / LOOP_PERIOD_MS};
 static_assert(AVERAGE_PERIOD_MS % LOOP_PERIOD_MS == 0,
               "Averaging window must be a whole number of sample periods");
 
+// Once the bed (either side) has been occupied this long since it was last
+// empty, the last-in-bed time updates to now every window.
+constexpr uint32_t IN_BED_MIN_MS {5UL * 60UL * 1000UL};  // 5 minutes
+constexpr uint32_t IN_BED_MIN_WINDOWS {IN_BED_MIN_MS / AVERAGE_PERIOD_MS};
+static_assert(IN_BED_MIN_MS % AVERAGE_PERIOD_MS == 0,
+              "In-bed minimum must be a whole number of averaging windows");
+
 // Clock ///////////////////////////////////////////////////////////////////////
 
 // Local timezone as a POSIX TZ string. The ESP32 applies the DST rules in it

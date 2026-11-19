@@ -46,7 +46,7 @@ The same commands work over USB serial (`pio device monitor`) and in the browser
 | Command | What it does |
 |---|---|
 | `set <0-3\|all> <low\|high> <value>` | Set a cutoff in raw ADC counts, e.g. `set 2 low 1400`. `low` must stay below `high` |
-| `show` | Print every sensor's cutoffs and latest readings |
+| `show` | Print every sensor's cutoffs, the bed's last-in-bed time, uptime with the last reset reason, the current occupied streak, and the latest readings |
 | `defaults` | Restore the default cutoffs on all sensors |
 | `help` | List commands |
 
@@ -67,13 +67,16 @@ GET http://bedoccupancy.local/state
 ```
 
 ```json
-{"left":false,"right":true,"time":1763512345}
+{"left":false,"right":true,"time":1763512345,"lastInBed":1763512345}
 ```
 
 | Field | Meaning |
 |---|---|
 | `left`, `right` | Whether that side of the bed is occupied |
 | `time` | When the measurement was taken (end of its 1 s averaging window), Unix seconds UTC. `null` until the clock has been set from NTP after boot |
+| `lastInBed` | Last time the bed (either side) had been occupied for 5 minutes or longer. `0` at boot. Seconds since boot until the clock is set from NTP, then Unix seconds UTC |
+
+**Last in bed.** If at least 5 minutes (`IN_BED_MIN_MS` in `src/config.h`) have passed since the bed was last empty (neither side occupied), `lastInBed` updates to now every second. Get in at 12:00 and it reads 12:05 at 12:05, then tracks the current time while either of you stays. Once both sides are empty at 13:00, it holds 13:00 until the bed is next occupied for 5 minutes straight. The value starts at 0 on every boot. It's stored as seconds since boot, and once NTP sets the clock it's published shifted by the offset between time since boot and real time, so a stretch recorded before the sync still reports the right time. A reboot mid-stretch restarts the 5-minute count.
 
 - Status 200 with `Content-Type: application/json` and `Cache-Control: no-store`.
 - Status 503 with `{"error":"starting"}` for the first second after boot, before the first measurement window completes.
