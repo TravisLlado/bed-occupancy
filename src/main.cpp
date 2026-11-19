@@ -2,13 +2,19 @@
  * Bed Occupancy - four-sensor hysteresis with a web console for tuning
  *
  * Four flat-flex (force-sensitive) sensors, each with its own 10k pullup to
- * 3.3V: high = no contact, low = full contact. Each sensor's raw reading runs
- * through a hysteresis filter with its own low/high cutoffs (see config.h).
- * The onboard LED is on while any sensor is occupied.
+ * 3.3V: high = no contact, low = full contact. Each sensor is sampled at 100 Hz
+ * and averaged over 1 s windows; each window's mean runs through a hysteresis
+ * filter with that sensor's own low/high cutoffs (see config.h). Each side of
+ * the bed is occupied while any of its sensors is. The onboard LED is on while
+ * either side is occupied.
+ *
+ * Other nodes read per-side state and the measurement timestamp as JSON from
+ * GET <STATE_PATH>. The clock is set from NTP after WiFi joins and re-synced
+ * nightly; sensing never waits on it.
  *
  * Commands are accepted from both USB serial and the web console
- * (http://<MDNS_HOSTNAME>.local/); type `help` for the list. Readings print to
- * both once per second, and every state change prints immediately.
+ * (http://<MDNS_HOSTNAME>.local/); type `help` for the list. Once per window,
+ * one line prints: timestamp, each sensor's average, and each side's state.
  */
 
 #include <Arduino.h>
@@ -17,7 +23,9 @@
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>
 #include <WebConsole.h>
+#include <esp_sntp.h>
 #include <stdarg.h>
+#include <time.h>
 #include "config.h"
 #include "credentials.h"
 
@@ -32,7 +40,25 @@ struct Cutoffs {
 
 static Cutoffs  g_cutoffs[NUM_SENSORS];
 static bool     g_occupied[NUM_SENSORS] {};
-static uint16_t g_raw[NUM_SENSORS] {};
+static uint32_t g_sum[NUM_SENSORS] {};    // window in progress
+static uint32_t g_accumCount {0};          // samples in the window in progress
+static uint16_t g_mean[NUM_SENSORS] {};    // last completed window's mean
+static bool     g_sideOccupied[2] {};      // indexed by Side
+static time_t   g_measuredAt {0};          // last window's end, 0 if clock unset
+
+// Latest state as served at STATE_PATH. Written by loop(), read by the HTTP
+// handler on the AsyncTCP task, so it's copied under a lock.
+struct StateSnapshot {
+  bool   ready;     // false until the first window completes
+  bool   left;
+  bool   right;
+  time_t measuredAt;
+};
+static portMUX_TYPE  s_stateMux = portMUX_INITIALIZER_UNLOCKED;
+static StateSnapshot s_state {};
+
+// Incremented by the SNTP task each time the clock is set from NTP
+static volatile uint32_t s_syncCount {0};
 
 AsyncWebServer    server(SERVER_PORT);
 static WebConsole webConsole;
@@ -72,13 +98,13 @@ static void loadCutoffs() {
   for (size_t i{0}; i < NUM_SENSORS; i++) {
     char key[8];
     keyFor(key, sizeof(key), "lo", i);
-    g_cutoffs[i].low = prefs.getUShort(key, DEFAULT_CUTOFF_LOW);
+    g_cutoffs[i].low = prefs.getUShort(key, DEFAULT_CUTOFF_LOW[i]);
     keyFor(key, sizeof(key), "hi", i);
-    g_cutoffs[i].high = prefs.getUShort(key, DEFAULT_CUTOFF_HIGH);
+    g_cutoffs[i].high = prefs.getUShort(key, DEFAULT_CUTOFF_HIGH[i]);
 
     // Guard against a corrupt or inconsistent stored pair
     if (g_cutoffs[i].low >= g_cutoffs[i].high || g_cutoffs[i].high > ADC_MAX) {
-      g_cutoffs[i] = {DEFAULT_CUTOFF_LOW, DEFAULT_CUTOFF_HIGH};
+      g_cutoffs[i] = {DEFAULT_CUTOFF_LOW[i], DEFAULT_CUTOFF_HIGH[i]};
     }
   }
   prefs.end();
@@ -98,15 +124,30 @@ static void saveCutoffs(size_t sensor) {
 // Printing
 // ============================================================================
 
-static void printReadings() {
-  char line[160];
-  size_t n{0};
-  bool any{false};
-  for (size_t i{0}; i < NUM_SENSORS; i++) {
-    n += snprintf(line + n, sizeof(line) - n, "%4u ", g_raw[i]);
-    any |= g_occupied[i];
+// Local time as "HH:MM:SS", or "--:--:--" before the clock is set
+static void formatClock(char* buf, size_t size, time_t t) {
+  if (t == 0) {
+    snprintf(buf, size, "--:--:--");
+    return;
   }
-  snprintf(line + n, sizeof(line) - n, "%s\n", any ? "Occupied" : "Empty");
+  struct tm lt;
+  localtime_r(&t, &lt);
+  strftime(buf, size, "%H:%M:%S", &lt);
+}
+
+// One line: measurement time, each sensor's average reading for the last
+// window, then each side's state
+static void printReadings() {
+  char line[96];
+  char clock[16];
+  formatClock(clock, sizeof(clock), g_measuredAt);
+  size_t n{(size_t)snprintf(line, sizeof(line), "%s |", clock)};
+  for (size_t i{0}; i < NUM_SENSORS; i++) {
+    n += snprintf(line + n, sizeof(line) - n, " %4u", g_mean[i]);
+  }
+  snprintf(line + n, sizeof(line) - n, " | L %s  R %s\n",
+           g_sideOccupied[SIDE_LEFT] ? "OCC" : "---",
+           g_sideOccupied[SIDE_RIGHT] ? "OCC" : "---");
   out("%s", line);
 }
 
@@ -121,10 +162,11 @@ static void printHelp() {
   out("Commands:\n");
   out("  set <0-%u|all> <low|high> <value>   set a cutoff (raw ADC 0-%u)\n",
       (unsigned)(NUM_SENSORS - 1), (unsigned)ADC_MAX);
-  out("  show                               show cutoffs and current readings\n");
+  out("  show                               show cutoffs and latest readings\n");
   out("  defaults                           restore default cutoffs on all sensors\n");
   out("  help                               this list\n");
-  out("Occupied when reading < low, unoccupied when reading > high. Low must be below high.\n");
+  out("Cutoffs apply to each sensor's %u ms average reading.\n", (unsigned)AVERAGE_PERIOD_MS);
+  out("Occupied when average < low, unoccupied when average > high. Low must be below high.\n");
   out("Example: set 2 low 1400\n");
 }
 
@@ -198,7 +240,7 @@ static void handleCommand(char* line) {
     printReadings();
   } else if (strcmp(cmd, "defaults") == 0) {
     for (size_t i{0}; i < NUM_SENSORS; i++) {
-      g_cutoffs[i] = {DEFAULT_CUTOFF_LOW, DEFAULT_CUTOFF_HIGH};
+      g_cutoffs[i] = {DEFAULT_CUTOFF_LOW[i], DEFAULT_CUTOFF_HIGH[i]};
       saveCutoffs(i);
     }
     out("Defaults restored and saved.\n");
@@ -254,24 +296,123 @@ static void pollSerialCommand() {
 }
 
 // ============================================================================
+// Clock
+// ============================================================================
+
+// Runs on the SNTP task
+static void onTimeSync(struct timeval*) { s_syncCount = s_syncCount + 1; }
+
+// True once the clock has been set from NTP at least once since boot. There's
+// no battery-backed RTC, so until then time() is meaningless.
+static bool clockValid() { return s_syncCount > 0; }
+
+// Start SNTP with the local timezone. SNTP retries on its own until the first
+// sync succeeds, then re-syncs in the background every few hours.
+static void startClock() {
+  sntp_set_time_sync_notification_cb(onTimeSync);
+  configTzTime(TIMEZONE_POSIX, NTP_SERVER_1, NTP_SERVER_2);
+}
+
+// Report the first sync, and force an NTP re-sync once a night at or after
+// NIGHTLY_SYNC_HOUR. Never blocks: a requested sync is checked on later calls.
+// A failed sync isn't fatal. The clock keeps running from its last sync, and
+// the TZ rules keep DST correct.
+static void serviceClock() {
+  static uint32_t seenSyncs{0};
+  static int      lastNightlyDay{-1};  // tm_yday of the last nightly sync
+  static bool     pending{false};
+  static uint32_t pendingSinceMs{0};
+  static uint32_t pendingBase{0};
+
+  const uint32_t syncs{s_syncCount};
+  if (syncs == 0) return;
+
+  const time_t now{time(nullptr)};
+  struct tm lt;
+  localtime_r(&now, &lt);
+
+  if (seenSyncs == 0) {
+    char buf[40];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &lt);
+    out("Clock set from NTP: %s\n", buf);
+    // A first sync after tonight's sync hour stands in for tonight's sync
+    if (lt.tm_hour >= NIGHTLY_SYNC_HOUR) lastNightlyDay = lt.tm_yday;
+  }
+  seenSyncs = syncs;
+
+  if (pending) {
+    if (syncs != pendingBase) {
+      pending = false;
+      out("Clock re-synced from NTP.\n");
+    } else if (millis() - pendingSinceMs >= NTP_SYNC_TIMEOUT_MS) {
+      pending = false;
+      out("NTP sync failed, using onboard clock.\n");
+    }
+  } else if (lt.tm_hour >= NIGHTLY_SYNC_HOUR && lt.tm_yday != lastNightlyDay) {
+    lastNightlyDay = lt.tm_yday;
+    pending = true;
+    pendingBase = syncs;
+    pendingSinceMs = millis();
+    sntp_restart();  // send a request now rather than at the next poll interval
+  }
+}
+
+// ============================================================================
+// HTTP state interface
+// ============================================================================
+
+// GET STATE_PATH. Runs on the AsyncTCP task.
+//   200 {"left":false,"right":true,"time":1763512345}
+//       time: end of the measurement window, Unix seconds UTC; null until the
+//       clock has been set from NTP
+//   503 {"error":"starting"} until the first measurement window completes
+static void handleState(AsyncWebServerRequest* request) {
+  StateSnapshot s;
+  portENTER_CRITICAL(&s_stateMux);
+  s = s_state;
+  portEXIT_CRITICAL(&s_stateMux);
+
+  AsyncWebServerResponse* response;
+  if (!s.ready) {
+    response = request->beginResponse(503, "application/json", "{\"error\":\"starting\"}");
+  } else {
+    char stamp[24];
+    if (s.measuredAt != 0) {
+      snprintf(stamp, sizeof(stamp), "%lld", (long long)s.measuredAt);
+    } else {
+      snprintf(stamp, sizeof(stamp), "null");
+    }
+    char body[80];
+    snprintf(body, sizeof(body), "{\"left\":%s,\"right\":%s,\"time\":%s}",
+             s.left ? "true" : "false", s.right ? "true" : "false", stamp);
+    response = request->beginResponse(200, "application/json", body);
+  }
+  response->addHeader("Cache-Control", "no-store");
+  request->send(response);
+}
+
+// ============================================================================
 // Network
 // ============================================================================
 
-// Bring up mDNS the first time WiFi connects, and re-join if it drops. Sensing
-// never waits on the network.
+// Bring up mDNS and the clock the first time WiFi connects, and re-join if it
+// drops. Sensing never waits on the network.
 static void serviceWifi() {
   static bool          announced{false};
   static unsigned long lastCheckMs{0};
 
   if (!announced && WiFi.status() == WL_CONNECTED) {
     announced = true;
+    startClock();
     if (MDNS.begin(MDNS_HOSTNAME)) {
       MDNS.addService("http", "tcp", SERVER_PORT);
     } else {
       Serial.println("mDNS failed");
     }
-    out("Web console: http://%s.local/  (http://%s/)\n", MDNS_HOSTNAME,
-        WiFi.localIP().toString().c_str());
+    const String ip{WiFi.localIP().toString()};
+    out("Web console: http://%s.local/  (http://%s/)\n", MDNS_HOSTNAME, ip.c_str());
+    out("State:       http://%s.local%s  (http://%s%s)\n", MDNS_HOSTNAME, STATE_PATH,
+        ip.c_str(), STATE_PATH);
   }
 
   const unsigned long now{millis()};
@@ -283,6 +424,51 @@ static void serviceWifi() {
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     }
   }
+}
+
+// ============================================================================
+// Sampling
+// ============================================================================
+
+static void resetAccum() {
+  for (uint32_t& sum : g_sum) sum = 0;
+  g_accumCount = 0;
+}
+
+// Add one sample per sensor to the window in progress
+static void sampleSensors() {
+  for (size_t i{0}; i < NUM_SENSORS; i++) {
+    g_sum[i] += analogRead(SENSOR_PINS[i]);
+  }
+  g_accumCount++;
+}
+
+// Close the window: compute means, run hysteresis, combine sensors into sides,
+// timestamp, publish, update LED, print
+static void finishWindow() {
+  g_measuredAt = clockValid() ? time(nullptr) : 0;
+
+  bool side[2] {};
+  for (size_t i{0}; i < NUM_SENSORS; i++) {
+    g_mean[i] = (uint16_t)((g_sum[i] + g_accumCount / 2) / g_accumCount);
+
+    if (!g_occupied[i] && g_mean[i] < g_cutoffs[i].low) {
+      g_occupied[i] = true;
+    } else if (g_occupied[i] && g_mean[i] > g_cutoffs[i].high) {
+      g_occupied[i] = false;
+    }
+    side[SENSOR_SIDES[i]] |= g_occupied[i];
+  }
+  g_sideOccupied[SIDE_LEFT]  = side[SIDE_LEFT];
+  g_sideOccupied[SIDE_RIGHT] = side[SIDE_RIGHT];
+
+  portENTER_CRITICAL(&s_stateMux);
+  s_state = {true, side[SIDE_LEFT], side[SIDE_RIGHT], g_measuredAt};
+  portEXIT_CRITICAL(&s_stateMux);
+
+  digitalWrite(LED_PIN, (side[SIDE_LEFT] || side[SIDE_RIGHT]) ? LED_ON : LED_OFF);
+  printReadings();
+  resetAccum();
 }
 
 // ============================================================================
@@ -303,6 +489,7 @@ void setup() {
 
   loadCutoffs();
   printCutoffs();
+  resetAccum();
 
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(MDNS_HOSTNAME);
@@ -314,6 +501,7 @@ void setup() {
                ARDUINO_EVENT_WIFI_STA_CONNECTED);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
+  server.on(STATE_PATH, HTTP_GET, handleState);
   webConsole.begin(server, "/", onWebLine);
   server.begin();
 
@@ -321,37 +509,15 @@ void setup() {
 }
 
 void loop() {
-  static TickType_t    lastWake{xTaskGetTickCount()};
-  static unsigned long lastStatusMs{0};
+  static TickType_t lastWake{xTaskGetTickCount()};
 
-  // Sample and filter
-  bool anyOccupied{false};
-  for (size_t i{0}; i < NUM_SENSORS; i++) {
-    g_raw[i] = analogRead(SENSOR_PINS[i]);
-
-    const bool prev{g_occupied[i]};
-    if (!g_occupied[i] && g_raw[i] < g_cutoffs[i].low) {
-      g_occupied[i] = true;
-    } else if (g_occupied[i] && g_raw[i] > g_cutoffs[i].high) {
-      g_occupied[i] = false;
-    }
-    if (g_occupied[i] != prev) {
-      out("S%u -> %s (raw %u)\n", (unsigned)i,
-          g_occupied[i] ? "OCCUPIED" : "UNOCCUPIED", g_raw[i]);
-    }
-    anyOccupied |= g_occupied[i];
-  }
-  digitalWrite(LED_PIN, anyOccupied ? LED_ON : LED_OFF);
+  sampleSensors();
+  if (g_accumCount >= SAMPLES_PER_AVERAGE) finishWindow();
 
   pollSerialCommand();
   pollWebCommand();
   serviceWifi();
-
-  const unsigned long now{millis()};
-  if (now - lastStatusMs >= STATUS_INTERVAL_MS) {
-    lastStatusMs = now;
-    printReadings();
-  }
+  serviceClock();
 
   // Send buffered output to the browser
   webConsole.loop();
